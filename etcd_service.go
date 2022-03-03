@@ -1,10 +1,9 @@
-package etcdreg
+package regdis
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/wuqtao/regdis"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"log"
 	"sync/atomic"
@@ -13,8 +12,8 @@ import (
 
 const ServiceNameAndIDSeparator = "/"
 
-type EtcdServiceReg struct {
-	service      regdis.Service
+type etcdServiceReg struct {
+	service      Service
 	etcdClient   *clientv3.Client
 	savePath     string
 	lease        clientv3.Lease
@@ -22,15 +21,15 @@ type EtcdServiceReg struct {
 	isUnregister int32 //原子操作，用于判定是否已经手动取消注册
 }
 
-func NewEtcdServiceReg(ser regdis.Service, client *clientv3.Client, savePath string) *EtcdServiceReg {
-	return &EtcdServiceReg{
+func newEtcdServiceReg(ser Service, client *clientv3.Client, savePath string) *etcdServiceReg {
+	return &etcdServiceReg{
 		service:    ser,
 		etcdClient: client,
 		savePath:   savePath,
 	}
 }
 
-func (es *EtcdServiceReg) Register() error {
+func (es *etcdServiceReg) Register() error {
 	lease := clientv3.NewLease(es.etcdClient)
 	ctx, _ := context.WithTimeout(context.TODO(), time.Second*5)
 	leResp, err := lease.Grant(ctx, 10)
@@ -51,7 +50,7 @@ func (es *EtcdServiceReg) Register() error {
 	return es.regLoop(leResp.ID)
 }
 
-func (es *EtcdServiceReg) regLoop(leaseId clientv3.LeaseID) error {
+func (es *etcdServiceReg) regLoop(leaseId clientv3.LeaseID) error {
 	keepRespChan, err := es.lease.KeepAlive(context.TODO(), leaseId)
 	if err != nil {
 		return err
@@ -78,7 +77,7 @@ func (es *EtcdServiceReg) regLoop(leaseId clientv3.LeaseID) error {
 	return nil
 }
 
-func (es *EtcdServiceReg) Deregister() error {
+func (es *etcdServiceReg) Deregister() error {
 	//未取消过才可以取消
 	if atomic.CompareAndSwapInt32(&es.isUnregister, 0, 1) {
 		fmt.Printf("服务id:%s取消注册\n", es.service.ServiceID())

@@ -1,10 +1,9 @@
-package etcdreg
+package regdis
 
 import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/wuqtao/regdis"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"log"
 	"strings"
@@ -12,21 +11,25 @@ import (
 	"time"
 )
 
-type EtcdRegistrationDiscoveryImp struct {
-	callBackMap     map[string]regdis.ServiceCallback //存储服务变化订阅的callback,key为serviceName，针对一个服务只能有一个订阅回调
+type etcdRegistrationDiscoveryImp struct {
+	callBackMap     map[string]ServiceCallback //存储服务变化订阅的callback,key为serviceName，针对一个服务只能有一个订阅回调
 	callBackMapLock *sync.RWMutex
 
-	fundServiceMap     map[string]map[string]regdis.Service //存储已经发现的服务，第一层key为service name，第二层key为service ID
+	fundServiceMap     map[string]map[string]Service //存储已经发现的服务，第一层key为service name，第二层key为service ID
 	fundServiceMapLock *sync.RWMutex
 
-	registerServiceMap map[string]*EtcdServiceReg //存储已经注册的服务,key为serviceName:serviceId
+	registerServiceMap map[string]*etcdServiceReg //存储已经注册的服务,key为serviceName:serviceId
 	registerMapLock    *sync.RWMutex
 
 	savePath   string           //etcd存储路径
 	etcdClient *clientv3.Client //etcdreg client v3
+
+	findDisable    bool //是否停用查找服务功能，停止find服务则不会watch etcd变动，但是则只能使用注册功能，不能使用查找和订阅功能
+	isInitFinish   bool
+	initFinishCond *sync.Cond
 }
 
-func NewEtcdRegistrationDiscoveryImp(endpoints []string, userName, password, savePath string) (regdis.RegistrationAndDiscovery, error) {
+func NewEtcdRegistrationDiscovery(endpoints []string, userName, password, savePath string, findDisable bool) (RegistrationAndDiscovery, error) {
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   endpoints,
 		DialTimeout: time.Second * 5,
@@ -38,23 +41,27 @@ func NewEtcdRegistrationDiscoveryImp(endpoints []string, userName, password, sav
 		return nil, err
 	}
 
-	etcdReg := &EtcdRegistrationDiscoveryImp{
-		callBackMap:        make(map[string]regdis.ServiceCallback),
+	etcdReg := &etcdRegistrationDiscoveryImp{
+		callBackMap:        make(map[string]ServiceCallback),
 		callBackMapLock:    &sync.RWMutex{},
-		registerServiceMap: make(map[string]*EtcdServiceReg),
+		registerServiceMap: make(map[string]*etcdServiceReg),
 		registerMapLock:    &sync.RWMutex{},
-		fundServiceMap:     make(map[string]map[string]regdis.Service),
+		fundServiceMap:     make(map[string]map[string]Service),
 		fundServiceMapLock: &sync.RWMutex{},
 		etcdClient:         client,
+		findDisable:        findDisable,
 		savePath:           fmt.Sprintf("/%s/", strings.Trim(savePath, "/")), //标准存储路径为/path/
+		initFinishCond:     sync.NewCond(&sync.Mutex{}),
 	}
-
-	go etcdReg.run()
+	//未停用查找功能，则初始化watch功能
+	if !etcdReg.findDisable {
+		go etcdReg.findAndWatch()
+	}
 	return etcdReg, nil
 }
 
-func (e *EtcdRegistrationDiscoveryImp) run() {
-	//启东时先从etcd读取一次数据
+func (e *etcdRegistrationDiscoveryImp) findAndWatch() {
+	//启动时先从etcd读取一次数据
 	kv := clientv3.NewKV(e.etcdClient)
 	resp, err := kv.Get(context.TODO(), e.savePath, clientv3.WithPrefix())
 	if err != nil {
@@ -68,21 +75,24 @@ func (e *EtcdRegistrationDiscoveryImp) run() {
 	e.fundServiceMapLock.Lock()
 	//将读取到的数据存储到发现列表
 	for _, kv := range resp.Kvs {
-		currSer, err := regdis.ParseServiceFromStr(string(kv.Value))
+		currSer, err := ParseServiceFromStr(string(kv.Value))
 		if err != nil {
-			log.Printf("run parse.ParseServiceFromStr error %s--%v\n", err.Error(), kv.Value)
+			log.Printf("findAndWatch parse.ParseServiceFromStr error %s--%v\n", err.Error(), kv.Value)
 			continue
 		}
 
 		if serMap, ok := e.fundServiceMap[currSer.ServiceName()]; ok {
 			serMap[currSer.ServiceID()] = currSer
 		} else {
-			serMap = map[string]regdis.Service{}
+			serMap = map[string]Service{}
 			serMap[currSer.ServiceID()] = currSer
 			e.fundServiceMap[currSer.ServiceName()] = serMap
 		}
 	}
 	e.fundServiceMapLock.Unlock()
+	//初始化完成后，通知等待事件的
+	e.isInitFinish = true
+	e.initFinishCond.Broadcast()
 	//从最前面查找到的数据的max revision + 1 开始watch，即watch上次查找后的对应目录的一切变动
 	watchChan := e.etcdClient.Watch(context.TODO(), e.savePath, clientv3.WithPrefix(), clientv3.WithRev(maxRevision+1))
 	for {
@@ -104,14 +114,14 @@ func (e *EtcdRegistrationDiscoveryImp) run() {
 				changeServiceNameList[serName] = 1
 				serMap, ok := e.fundServiceMap[serName]
 				if !ok {
-					serMap = make(map[string]regdis.Service)
+					serMap = make(map[string]Service)
 				}
 
 				//从字符串解析出service对象
 				switch event.Type {
 				case clientv3.EventTypePut:
 					log.Printf("新增服务id:%s\n", serID)
-					currSer, err := regdis.ParseServiceFromStr(string(event.Kv.Value))
+					currSer, err := ParseServiceFromStr(string(event.Kv.Value))
 					if err != nil {
 						log.Printf("parse.ParseServiceFromStr error %s--%v\n", err.Error(), event.Kv.Value)
 						continue
@@ -131,7 +141,7 @@ func (e *EtcdRegistrationDiscoveryImp) run() {
 			for k, v := range e.callBackMap {
 				//有变动则调用相应的函数
 				if _, ok := changeServiceNameList[k]; ok {
-					newSers := []regdis.Service{}
+					newSers := []Service{}
 					serMap, ok := e.fundServiceMap[k]
 					if ok {
 						for _, ser := range serMap {
@@ -143,7 +153,6 @@ func (e *EtcdRegistrationDiscoveryImp) run() {
 						go v(newSers)
 					}
 				}
-
 			}
 			e.callBackMapLock.RUnlock()
 			e.fundServiceMapLock.Unlock()
@@ -152,7 +161,7 @@ func (e *EtcdRegistrationDiscoveryImp) run() {
 }
 
 //向注册中心注册服务
-func (e *EtcdRegistrationDiscoveryImp) Register(ser regdis.Service) error {
+func (e *etcdRegistrationDiscoveryImp) Register(ser Service) error {
 	e.registerMapLock.RLock()
 	if _, ok := e.registerServiceMap[getRegisterMapKey(ser)]; ok {
 		e.registerMapLock.RUnlock()
@@ -160,7 +169,7 @@ func (e *EtcdRegistrationDiscoveryImp) Register(ser regdis.Service) error {
 	}
 	e.registerMapLock.RUnlock()
 
-	etcdService := NewEtcdServiceReg(ser, e.etcdClient, e.savePath)
+	etcdService := newEtcdServiceReg(ser, e.etcdClient, e.savePath)
 	err := etcdService.Register()
 	if err != nil {
 		return err
@@ -175,7 +184,7 @@ func (e *EtcdRegistrationDiscoveryImp) Register(ser regdis.Service) error {
 }
 
 //从注册中心取消注册
-func (e *EtcdRegistrationDiscoveryImp) Deregister(ser regdis.Service) error {
+func (e *etcdRegistrationDiscoveryImp) Deregister(ser Service) error {
 	e.registerMapLock.Lock()
 	defer e.registerMapLock.Unlock()
 	serKey := getRegisterMapKey(ser)
@@ -191,22 +200,33 @@ func (e *EtcdRegistrationDiscoveryImp) Deregister(ser regdis.Service) error {
 }
 
 //根据服务名查找服务列表
-func (e *EtcdRegistrationDiscoveryImp) Find(serviceName string) ([]regdis.Service, error) {
+func (e *etcdRegistrationDiscoveryImp) Find(serviceName string) ([]Service, error) {
+	if e.findDisable {
+		return nil, errors.New("you hava set find disable can not use find")
+	}
+	//使用cond阻塞直到e.findAndWatch()初始化成功
+	e.initFinishCond.L.Lock()
+	for !e.isInitFinish {
+		e.initFinishCond.Wait()
+	}
+	e.initFinishCond.L.Unlock()
 	//因为已经启动了所有的service的监控，所以并不需要再次从etcd中查询，直接取本地存储值即可
 	e.fundServiceMapLock.RLock()
 	defer e.fundServiceMapLock.RUnlock()
+	serList := []Service{}
 	if serMap, ok := e.fundServiceMap[serviceName]; ok {
-		serList := []regdis.Service{}
 		for _, v := range serMap {
 			serList = append(serList, v)
 		}
-		return serList, nil
 	}
-	return nil, errors.New("there is no service for given name")
+	return serList, nil
 }
 
 //供外部使用，订阅某个服务的变化情况，一个服务只能有一个订阅回调
-func (e *EtcdRegistrationDiscoveryImp) Subscribe(serviceName string, callback regdis.ServiceCallback) error {
+func (e *etcdRegistrationDiscoveryImp) Subscribe(serviceName string, callback ServiceCallback) error {
+	if e.findDisable {
+		return errors.New("you hava set find disable can not use subscribe")
+	}
 	e.callBackMapLock.Lock()
 	defer e.callBackMapLock.Unlock()
 	if _, ok := e.callBackMap[serviceName]; ok {
@@ -217,21 +237,23 @@ func (e *EtcdRegistrationDiscoveryImp) Subscribe(serviceName string, callback re
 }
 
 //取消针对服务名的订阅
-func (e *EtcdRegistrationDiscoveryImp) Unsubscribe(serviceName string) error {
+func (e *etcdRegistrationDiscoveryImp) Unsubscribe(serviceName string) error {
+	if e.findDisable {
+		return errors.New("you hava set find disable can not use subscribe , so do not need call unsubscribe")
+	}
 	e.callBackMapLock.Lock()
 	defer e.callBackMapLock.Unlock()
 	delete(e.callBackMap, serviceName)
 	return nil
 }
 
-func getRegisterMapKey(ser regdis.Service) string {
+func getRegisterMapKey(ser Service) string {
 	return fmt.Sprintf("%s:%s", ser.ServiceName(), ser.ServiceID())
 }
 
 //通过给定的etcd Key获取serviceName,serviceId
 func getServiceNameAndId(savePath, key string) (serviceName, serviceId string, err error) {
 	str := strings.Replace(key, savePath, "", 1)
-	//str := string(key[len(savePath):])
 	if str != "" && strings.Contains(str, ServiceNameAndIDSeparator) {
 		strArr := strings.Split(str, ServiceNameAndIDSeparator)
 		if len(strArr) == 2 {

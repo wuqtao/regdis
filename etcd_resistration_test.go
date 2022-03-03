@@ -1,21 +1,20 @@
-package etcdreg
+package regdis
 
 import (
 	"github.com/stretchr/testify/assert"
-	"github.com/wuqtao/regdis"
 	"sync"
 	"testing"
 	"time"
 )
 
 func Test_Naming(t *testing.T) {
-	ns, err := NewEtcdRegistrationDiscoveryImp([]string{"127.0.0.1:2379"}, "", "", "/service/test")
+	ns, err := NewEtcdRegistrationDiscovery([]string{"127.0.0.1:2379"}, "", "", "/service/test", false)
 	assert.Nil(t, err)
 
 	// 准备工作
 	serviceName := "service"
-	ser1 := regdis.NewService("gateway", serviceName, "test1", "tcp", "127.0.0.1", 8099)
-	ser2 := regdis.NewService("gateway", serviceName, "test2", "tcp", "127.0.0.1", 8099)
+	ser1 := NewService("gateway", serviceName, "test1", "tcp", "127.0.0.1", 8099)
+	ser2 := NewService("gateway", serviceName, "test2", "tcp", "127.0.0.1", 8099)
 	_ = ns.Deregister(ser1)
 	_ = ns.Deregister(ser2)
 	time.Sleep(time.Second)
@@ -36,7 +35,7 @@ func Test_Naming(t *testing.T) {
 	wg.Add(1)
 
 	// 3. 监听服务实时变化（新增）
-	_ = ns.Subscribe(serviceName, func(services []regdis.Service) {
+	_ = ns.Subscribe(serviceName, func(services []Service) {
 		t.Log(len(services))
 
 		assert.Equal(t, 2, len(services))
