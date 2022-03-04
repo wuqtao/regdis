@@ -8,7 +8,7 @@ import (
 )
 
 func Test_Naming(t *testing.T) {
-	ns, err := NewEtcdRegistrationDiscovery([]string{"127.0.0.1:2379"}, "", "", "/service/test", false)
+	ns, err := NewEtcdRegistrationDiscovery([]string{"127.0.0.1:2379"}, "", "", "/service/test", false, time.Second*5)
 	assert.Nil(t, err)
 
 	// 准备工作

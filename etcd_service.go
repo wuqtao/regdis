@@ -19,19 +19,21 @@ type etcdServiceReg struct {
 	lease        clientv3.Lease
 	leaseId      clientv3.LeaseID
 	isUnregister int32 //原子操作，用于判定是否已经手动取消注册
+	timeOut      time.Duration
 }
 
-func newEtcdServiceReg(ser Service, client *clientv3.Client, savePath string) *etcdServiceReg {
+func newEtcdServiceReg(ser Service, client *clientv3.Client, savePath string, timeOut time.Duration) *etcdServiceReg {
 	return &etcdServiceReg{
 		service:    ser,
 		etcdClient: client,
 		savePath:   savePath,
+		timeOut:    timeOut,
 	}
 }
 
 func (es *etcdServiceReg) Register() error {
 	lease := clientv3.NewLease(es.etcdClient)
-	ctx, _ := context.WithTimeout(context.TODO(), time.Second*5)
+	ctx, _ := context.WithTimeout(context.Background(), es.timeOut)
 	leResp, err := lease.Grant(ctx, 10)
 	if err != nil {
 		return err
@@ -42,7 +44,8 @@ func (es *etcdServiceReg) Register() error {
 	kv := clientv3.NewKV(es.etcdClient)
 
 	key := fmt.Sprintf("%s%s%s%s", es.savePath, es.service.ServiceName(), ServiceNameAndIDSeparator, es.service.ServiceID())
-	_, err = kv.Put(context.TODO(), key, es.service.String(), clientv3.WithLease(leResp.ID))
+	ctx, _ = context.WithTimeout(context.Background(), es.timeOut)
+	_, err = kv.Put(ctx, key, es.service.String(), clientv3.WithLease(leResp.ID))
 	if err != nil {
 		return err
 	}
@@ -81,7 +84,8 @@ func (es *etcdServiceReg) Deregister() error {
 	//未取消过才可以取消
 	if atomic.CompareAndSwapInt32(&es.isUnregister, 0, 1) {
 		fmt.Printf("服务id:%s取消注册\n", es.service.ServiceID())
-		_, err := es.lease.Revoke(context.TODO(), es.leaseId)
+		ctx, _ := context.WithTimeout(context.Background(), es.timeOut)
+		_, err := es.lease.Revoke(ctx, es.leaseId)
 		return err
 	}
 	return errors.New("service already deregister , do not repeat")

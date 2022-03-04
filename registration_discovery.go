@@ -27,18 +27,26 @@ type etcdRegistrationDiscoveryImp struct {
 	findDisable    bool //是否停用查找服务功能，停止find服务则不会watch etcd变动，但是则只能使用注册功能，不能使用查找和订阅功能
 	isInitFinish   bool
 	initFinishCond *sync.Cond
+	timeOut        time.Duration
 }
 
-func NewEtcdRegistrationDiscovery(endpoints []string, userName, password, savePath string, findDisable bool) (RegistrationAndDiscovery, error) {
+func NewEtcdRegistrationDiscovery(endpoints []string, userName, password, savePath string, findDisable bool, timeOut time.Duration) (RegistrationAndDiscovery, error) {
 	client, err := clientv3.New(clientv3.Config{
 		Endpoints:   endpoints,
-		DialTimeout: time.Second * 5,
+		DialTimeout: timeOut,
 		Username:    userName,
 		Password:    password,
+		//DialOptions: []grpc.DialOption{grpc.WithBlock()},
 	})
 
 	if err != nil {
 		return nil, err
+	}
+	//判断etcd是否能够连通
+	ctx, _ := context.WithTimeout(context.Background(), timeOut)
+	_, err = client.Status(ctx, client.Endpoints()[0])
+	if err != nil {
+		return nil, errors.New(fmt.Sprintf("connect etcd error %s", err.Error()))
 	}
 
 	etcdReg := &etcdRegistrationDiscoveryImp{
@@ -52,6 +60,7 @@ func NewEtcdRegistrationDiscovery(endpoints []string, userName, password, savePa
 		findDisable:        findDisable,
 		savePath:           fmt.Sprintf("/%s/", strings.Trim(savePath, "/")), //标准存储路径为/path/
 		initFinishCond:     sync.NewCond(&sync.Mutex{}),
+		timeOut:            timeOut,
 	}
 	//未停用查找功能，则初始化watch功能
 	if !etcdReg.findDisable {
@@ -61,9 +70,15 @@ func NewEtcdRegistrationDiscovery(endpoints []string, userName, password, savePa
 }
 
 func (e *etcdRegistrationDiscoveryImp) findAndWatch() {
+	defer func() {
+		//初始化完成后，通知等待事件的
+		e.isInitFinish = true
+		e.initFinishCond.Broadcast()
+	}()
 	//启动时先从etcd读取一次数据
 	kv := clientv3.NewKV(e.etcdClient)
-	resp, err := kv.Get(context.TODO(), e.savePath, clientv3.WithPrefix())
+	ctx, _ := context.WithTimeout(context.Background(), e.timeOut)
+	resp, err := kv.Get(ctx, e.savePath, clientv3.WithPrefix())
 	if err != nil {
 		log.Printf("query etcdreg error %s\n", err.Error())
 		return
@@ -90,11 +105,13 @@ func (e *etcdRegistrationDiscoveryImp) findAndWatch() {
 		}
 	}
 	e.fundServiceMapLock.Unlock()
-	//初始化完成后，通知等待事件的
-	e.isInitFinish = true
-	e.initFinishCond.Broadcast()
+	go e.watchLoop(maxRevision + 1)
+}
+
+func (e *etcdRegistrationDiscoveryImp) watchLoop(startWatchRevision int64) {
 	//从最前面查找到的数据的max revision + 1 开始watch，即watch上次查找后的对应目录的一切变动
-	watchChan := e.etcdClient.Watch(context.TODO(), e.savePath, clientv3.WithPrefix(), clientv3.WithRev(maxRevision+1))
+	//watch这里的context不能使用带有过期时间的
+	watchChan := e.etcdClient.Watch(context.TODO(), e.savePath, clientv3.WithPrefix(), clientv3.WithRev(startWatchRevision))
 	for {
 		select {
 		case ser := <-watchChan:
@@ -169,7 +186,7 @@ func (e *etcdRegistrationDiscoveryImp) Register(ser Service) error {
 	}
 	e.registerMapLock.RUnlock()
 
-	etcdService := newEtcdServiceReg(ser, e.etcdClient, e.savePath)
+	etcdService := newEtcdServiceReg(ser, e.etcdClient, e.savePath, e.timeOut)
 	err := etcdService.Register()
 	if err != nil {
 		return err

@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	serviceReg, err := regdis.NewEtcdRegistrationDiscovery([]string{"127.0.0.1:2379"}, "", "", "/service/rpc", false)
+	serviceReg, err := regdis.NewEtcdRegistrationDiscovery([]string{"127.0.0.1:2379"}, "", "", "/service/rpc", false, time.Second*5)
 	if err != nil {
 		log.Fatalf("register grpc service fail:%s\n", err.Error())
 	}
